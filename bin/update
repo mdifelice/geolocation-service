@@ -1,0 +1,191 @@
+#!/usr/bin/php
+<?php
+define( 'FILE_IP', 'http://download.db-ip.com/free/dbip-city-' . date( 'Y-m' ) . '.csv.gz' );
+define( 'FILE_MARKET', 'http://webservices.entravision.com/tools/EVC-Geoloc/create_js_from_Cities-DMA%20Regions%20Master3_withDefault.php' );
+define( 'FILE_MAPPING', __DIR__ . '/../data/mapping.bin' );
+define( 'FILE_PID', __DIR__ . '/../data/server.pid' );
+define( 'FILE_PID_UPDATE', __DIR__ . '/../data/update.pid' );
+
+function message( $message, $eol = true ) {
+	static $last_eol = true;
+
+	if( $eol && empty( $last_eol ) )
+		echo "\n";
+
+	echo '[' . date( 'Y-m-d H:i:s' ) . '] ' . $message . ( $eol ? PHP_EOL : '' );
+
+	$last_eol = $eol;
+}
+
+function percentage( $message, $percentage ) {
+	global $last_message;
+
+	$message = sprintf( '%s%.1f%%', $message, $percentage * 100 );
+
+	if( empty( $last_message ) || $message != $last_message ) {
+		echo "\r" . message( $message, false );
+
+		$last_message = $message;
+	}
+}
+
+$unlink_pid = false;
+
+try {
+	$mode 		= 'regular';
+	$download 	= false;
+	$file_ip 	= __DIR__ . '/../data/' . preg_replace( '/\.gz$/', '', basename( FILE_IP ) );
+
+	foreach( $argv as $arg ) {
+		switch( $arg ) {
+			case '-f':
+				$mode = 'force';
+				break;
+			case '-r':
+				$mode = 'rebuild';
+				break;
+		}
+	}
+
+	if( file_exists( FILE_PID_UPDATE ) )
+		throw new Exception( 'Update already in progress.' );
+
+	if( ! file_put_contents( FILE_PID_UPDATE, getmypid() ) )
+		throw new Exception( 'Cannot write PID file.' );
+
+	$unlink_pid = true;
+
+	if( ! is_writable( FILE_MAPPING ) )
+		throw new Exception( 'No permissions to write output file.' );
+
+	if( file_exists( $file_ip ) ) {
+	   	if( $mode == 'regular' )
+			throw new Exception( 'System up to date.' );
+		elseif( $mode == 'force' )
+			$download = true;
+	}
+	else
+		$download = true;
+
+	if( ! ( $context = stream_context_create( array(), array( 'notification' => function( $code, $severity, $message, $message_code, $bytes_transferred, $bytes_max ) {
+		if( $code == STREAM_NOTIFY_PROGRESS && $bytes_max )
+			percentage( 'Downloaded ', $bytes_transferred / $bytes_max );
+		} ) ) ) )
+		throw new Exception( 'Cannot create context.' );
+
+	if( $download ) {
+		message( 'Downloading IP file...' );
+
+		if( ! ( $contents = file_get_contents( FILE_IP, false, $context ) ) )
+			throw new Exception( 'Cannot download file.' );
+
+		message( 'Writing IP file...' );
+
+		$file_ip_zipped = $file_ip . '.gz';
+
+		if( ! file_put_contents( $file_ip_zipped, $contents ) )
+			throw new Exception( 'Cannot write file.' );
+
+		message( 'Unzipping data file...' );
+
+		system( 'gunzip -f ' . escapeshellarg( $file_ip_zipped ) );
+
+		if( ! file_exists( $file_ip ) )
+			throw new Exception( 'Cannot unzip file.' );
+	}
+	else
+		message( 'IP file download skipped.' );
+
+	message( 'Downloading markets file...' );
+
+	if( ! ( $contents = file_get_contents( FILE_MARKET, false, $context ) ) )
+		throw new Exception( 'Cannot download file.' );
+
+	$file_market = __DIR__ . '/../data/markets.json';
+
+	message( 'Decoding markets file...' );
+
+	$contents = preg_replace( '/^var geolocation_mapping = /', '', $contents );
+
+	if( ! ( $markets = json_decode( $contents, true ) ) )
+		throw new Exception( 'Cannot decode contents.' );
+
+	message( 'Loading IP file...' );
+
+	if( ! ( $fp = fopen( $file_ip, 'r' ) ) )
+		throw new Exception( 'Cannot open file.' );
+
+	$size		= filesize( $file_ip );
+	$read		= 0;
+	$mapping	= array();
+
+	while( $line = fgets( $fp ) ) {
+		$data = array_map( function( $a ) { return trim( $a, '"' ); }, explode( ',', trim( $line ) ) );
+
+		if( count( $data ) == 5 ) {
+			$ip_from	= $data[0];
+			$ip_until	= $data[1];
+			$country	= strtoupper( $data[2] );
+			$region		= strtoupper( $data[3] );
+			$city		= strtoupper( $data[4] );
+
+			if( $country == 'US' ||
+				$country == 'MX' ||
+				$country == 'PR' ) {
+				if( isset( $markets[ $region ] ) ) {
+					$market = false;
+
+					if( isset( $markets[ $region ][ $city ] ) )
+						$market = $markets[ $region ][ $city ];
+					elseif( isset( $markets[ $region ][ 'default-dma' ] ) )
+						$market = $markets[ $region ][ 'default-dma' ];
+
+					if( $market )
+						$mapping[] = array( $ip_from, $ip_until, $market );
+				}
+			}
+		}
+
+		$read += strlen( $line );
+
+		percentage( 'Analyzed ', $read / $size );
+	}
+
+	message( 'Opening mapping file for writing...' );
+
+	if( ! ( $fp = fopen( FILE_MAPPING, 'w' ) ) )
+		throw new Exception( 'Cannot open file.' );
+
+	for( $i = 0; $i < count( $mapping ); $i++ ) {
+		$ip_from 	= inet_pton( $mapping[ $i ][0] );
+		$ip_until 	= inet_pton( $mapping[ $i ][1] );
+
+		$data = pack( 'C', strlen( $ip_from ) + strlen( $ip_until ) );
+		$data .= $ip_from . $ip_until;
+		$data .= $mapping[ $i ][2];
+
+		if( $i < count( $mapping ) - 1 )
+			$data .= pack( 'C', 0 );
+
+		if( ! fwrite( $fp, $data ) )
+			throw new Exception( 'Cannot write file.' );
+
+		percentage( 'Wrote ', ( $i + 1 ) / count( $mapping ) );
+	}
+
+	if( file_exists( FILE_PID ) ) {
+		message( 'Sending reload signal to process...' );
+
+		posix_kill( file_get_contents( FILE_PID ), SIGUSR1 );
+	}
+
+	fclose( $fp );
+}
+catch( Exception $e ) {
+	message( 'ERROR: ' . $e->getMessage() );
+}
+
+if( $unlink_pid )
+	unlink( FILE_PID_UPDATE );
+
+message( 'Finished' );
